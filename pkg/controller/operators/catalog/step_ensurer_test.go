@@ -1,6 +1,7 @@
 package catalog
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -206,15 +207,17 @@ func TestEnsureServiceAccount(t *testing.T) {
 	saName := "test-sa"
 
 	tests := []struct {
-		name                   string
-		existingServiceAccount *corev1.ServiceAccount
-		newServiceAccount      *corev1.ServiceAccount
-		expectedAnnotations    map[string]string
-		expectedStatus         v1alpha1.StepStatus
-		expectError            bool
-		createError            error
-		getError               error
-		updateError            error
+		name                     string
+		existingServiceAccount   *corev1.ServiceAccount
+		existingSecrets          []runtime.Object
+		newServiceAccount        *corev1.ServiceAccount
+		expectedAnnotations      map[string]string
+		expectedStatus           v1alpha1.StepStatus
+		expectError              bool
+		createError              error
+		getError                 error
+		updateError              error
+		verifyTokenSecretCreated bool
 	}{
 		{
 			name: "create new service account",
@@ -339,6 +342,58 @@ func TestEnsureServiceAccount(t *testing.T) {
 			getError:    apierrors.NewInternalError(assert.AnError),
 			expectError: true,
 		},
+		{
+			name: "create new service account - includes token secret creation",
+			newServiceAccount: &corev1.ServiceAccount{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      saName,
+					Namespace: namespace,
+				},
+			},
+			expectedAnnotations:      map[string]string{},
+			expectedStatus:           v1alpha1.StepStatusCreated,
+			verifyTokenSecretCreated: true,
+		},
+		{
+			name: "update existing service account - token secret already exists",
+			existingServiceAccount: &corev1.ServiceAccount{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      saName,
+					Namespace: namespace,
+				},
+				Secrets: []corev1.ObjectReference{
+					{Name: saName + "-token"},
+				},
+			},
+			existingSecrets: []runtime.Object{
+				&corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      saName + "-token",
+						Namespace: namespace,
+						Annotations: map[string]string{
+							corev1.ServiceAccountNameKey: saName,
+						},
+						Labels: map[string]string{
+							"olm.managed": "true",
+						},
+					},
+					Type: corev1.SecretTypeServiceAccountToken,
+				},
+			},
+			newServiceAccount: &corev1.ServiceAccount{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      saName,
+					Namespace: namespace,
+					Annotations: map[string]string{
+						"new-annotation": "value",
+					},
+				},
+			},
+			expectedAnnotations:      map[string]string{"new-annotation": "value"},
+			expectedStatus:           v1alpha1.StepStatusPresent,
+			createError:              apierrors.NewAlreadyExists(corev1.Resource("serviceaccounts"), saName),
+			verifyTokenSecretCreated: true, // Verifies it's not duplicated
+		},
 	}
 
 	for _, tc := range tests {
@@ -353,6 +408,9 @@ func TestEnsureServiceAccount(t *testing.T) {
 			var objects []runtime.Object
 			if tc.existingServiceAccount != nil {
 				objects = append(objects, tc.existingServiceAccount)
+			}
+			if tc.existingSecrets != nil {
+				objects = append(objects, tc.existingSecrets...)
 			}
 
 			//nolint:staticcheck // SA1019: NewClientset not available until apply configurations are generated
@@ -422,6 +480,332 @@ func TestEnsureServiceAccount(t *testing.T) {
 			} else {
 				require.NoError(t, err)
 				assert.Equal(t, tc.expectedStatus, status)
+
+				// Verify token secret creation if requested
+				if tc.verifyTokenSecretCreated {
+					secretName := saName + "-token"
+					secret, err := fakeClient.CoreV1().Secrets(namespace).Get(
+						context.TODO(), secretName, metav1.GetOptions{},
+					)
+					require.NoError(t, err, "token secret should have been created")
+
+					// Verify secret type
+					assert.Equal(t, corev1.SecretTypeServiceAccountToken, secret.Type)
+
+					// Verify annotation linking to ServiceAccount
+					assert.Equal(t, saName, secret.Annotations[corev1.ServiceAccountNameKey])
+
+					// Verify OLM managed label
+					assert.Equal(t, "true", secret.Labels["olm.managed"])
+
+					// Verify no duplicate secrets were created
+					secrets, err := fakeClient.CoreV1().Secrets(namespace).List(
+						context.TODO(), metav1.ListOptions{},
+					)
+					require.NoError(t, err)
+
+					tokenSecretCount := 0
+					for _, s := range secrets.Items {
+						if s.Name == secretName && s.Type == corev1.SecretTypeServiceAccountToken {
+							tokenSecretCount++
+						}
+					}
+
+					assert.Equal(t, 1, tokenSecretCount, "should have exactly one token secret, not duplicates")
+				}
+			}
+		})
+	}
+}
+
+func TestEnsureServiceAccountTokenSecret(t *testing.T) {
+	namespace := "test-namespace"
+	saName := "test-sa"
+
+	tests := []struct {
+		name                  string
+		serviceAccount        *corev1.ServiceAccount
+		existingSecrets       []runtime.Object
+		expectSecretCreation  bool
+		expectError           bool
+		expectedErrorContains string
+		secretGetError        error
+		secretCreateError     error
+	}{
+		{
+			name: "creates token secret for new service account with no secrets",
+			serviceAccount: &corev1.ServiceAccount{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      saName,
+					Namespace: namespace,
+				},
+			},
+			expectSecretCreation: true,
+		},
+		{
+			name: "skips creation when token secret already exists in SA.Secrets",
+			serviceAccount: &corev1.ServiceAccount{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      saName,
+					Namespace: namespace,
+				},
+				Secrets: []corev1.ObjectReference{
+					{Name: saName + "-token"},
+				},
+			},
+			existingSecrets: []runtime.Object{
+				&corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      saName + "-token",
+						Namespace: namespace,
+					},
+					Type: corev1.SecretTypeServiceAccountToken,
+				},
+			},
+			expectSecretCreation: false,
+		},
+		{
+			name: "creates token when only non-token secrets exist",
+			serviceAccount: &corev1.ServiceAccount{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      saName,
+					Namespace: namespace,
+				},
+				Secrets: []corev1.ObjectReference{
+					{Name: "some-other-secret"},
+				},
+			},
+			existingSecrets: []runtime.Object{
+				&corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "some-other-secret",
+						Namespace: namespace,
+					},
+					Type: corev1.SecretTypeOpaque,
+				},
+			},
+			expectSecretCreation: true,
+		},
+		{
+			name: "creates token when multiple non-token secrets exist",
+			serviceAccount: &corev1.ServiceAccount{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      saName,
+					Namespace: namespace,
+				},
+				Secrets: []corev1.ObjectReference{
+					{Name: "secret-1"},
+					{Name: "secret-2"},
+				},
+			},
+			existingSecrets: []runtime.Object{
+				&corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "secret-1",
+						Namespace: namespace,
+					},
+					Type: corev1.SecretTypeOpaque,
+				},
+				&corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "secret-2",
+						Namespace: namespace,
+					},
+					Type: corev1.SecretTypeDockerConfigJson,
+				},
+			},
+			expectSecretCreation: true,
+		},
+		{
+			name: "skips creation when one of multiple secrets is a token",
+			serviceAccount: &corev1.ServiceAccount{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      saName,
+					Namespace: namespace,
+				},
+				Secrets: []corev1.ObjectReference{
+					{Name: "secret-1"},
+					{Name: saName + "-token"},
+				},
+			},
+			existingSecrets: []runtime.Object{
+				&corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "secret-1",
+						Namespace: namespace,
+					},
+					Type: corev1.SecretTypeOpaque,
+				},
+				&corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      saName + "-token",
+						Namespace: namespace,
+					},
+					Type: corev1.SecretTypeServiceAccountToken,
+				},
+			},
+			expectSecretCreation: false,
+		},
+		{
+			name: "reuses orphaned token secret instead of creating duplicate",
+			serviceAccount: &corev1.ServiceAccount{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      saName,
+					Namespace: namespace,
+				},
+			},
+			existingSecrets: []runtime.Object{
+				&corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      saName + "-token",
+						Namespace: namespace,
+					},
+					Type: corev1.SecretTypeServiceAccountToken,
+				},
+			},
+			expectSecretCreation: false,
+		},
+		{
+			name: "creates token when orphaned secret exists but is not token type",
+			serviceAccount: &corev1.ServiceAccount{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      saName,
+					Namespace: namespace,
+				},
+			},
+			existingSecrets: []runtime.Object{
+				&corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      saName + "-token",
+						Namespace: namespace,
+					},
+					Type: corev1.SecretTypeOpaque,
+				},
+			},
+			expectSecretCreation: true,
+		},
+		{
+			name: "propagates secret creation error",
+			serviceAccount: &corev1.ServiceAccount{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      saName,
+					Namespace: namespace,
+				},
+			},
+			secretCreateError:     apierrors.NewInternalError(assert.AnError),
+			expectError:           true,
+			expectedErrorContains: "Internal error",
+		},
+		{
+			name: "propagates secret get error when checking referenced secrets",
+			serviceAccount: &corev1.ServiceAccount{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      saName,
+					Namespace: namespace,
+				},
+				Secrets: []corev1.ObjectReference{
+					{Name: "some-secret"},
+				},
+			},
+			secretGetError:        apierrors.NewInternalError(assert.AnError),
+			expectError:           true,
+			expectedErrorContains: "Internal error",
+		},
+		{
+			name: "handles NotFound error when checking referenced secrets",
+			serviceAccount: &corev1.ServiceAccount{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      saName,
+					Namespace: namespace,
+				},
+				Secrets: []corev1.ObjectReference{
+					{Name: "missing-secret"},
+				},
+			},
+			expectSecretCreation: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+
+			mockClient := operatorclientmocks.NewMockClientInterface(ctrl)
+
+			objects := append([]runtime.Object{tc.serviceAccount}, tc.existingSecrets...)
+			//nolint:staticcheck // SA1019: NewClientset not available until apply configurations are generated
+			fakeClient := k8sfake.NewSimpleClientset(objects...)
+
+			mockClient.EXPECT().KubernetesInterface().Return(fakeClient).AnyTimes()
+
+			// Set up reactors for error simulation
+			if tc.secretCreateError != nil {
+				fakeClient.PrependReactor("create", "secrets", func(action k8stesting.Action) (handled bool, ret runtime.Object, err error) {
+					return true, nil, tc.secretCreateError
+				})
+			}
+
+			if tc.secretGetError != nil {
+				fakeClient.PrependReactor("get", "secrets", func(action k8stesting.Action) (handled bool, ret runtime.Object, err error) {
+					return true, nil, tc.secretGetError
+				})
+			}
+
+			ensurer := &StepEnsurer{
+				kubeClient: mockClient,
+				//nolint:staticcheck // SA1019: NewClientset not available until apply configurations are generated
+				crClient:      fake.NewSimpleClientset(),
+				dynamicClient: fakedynamic.NewSimpleDynamicClient(runtime.NewScheme()),
+			}
+
+			err := ensurer.ensureServiceAccountTokenSecret(namespace, tc.serviceAccount)
+
+			if tc.expectError {
+				require.Error(t, err)
+				if tc.expectedErrorContains != "" {
+					assert.Contains(t, err.Error(), tc.expectedErrorContains)
+				}
+			} else {
+				require.NoError(t, err)
+
+				if tc.expectSecretCreation {
+					// Verify secret was created with correct structure
+					secretName := saName + "-token"
+					secret, err := fakeClient.CoreV1().Secrets(namespace).Get(
+						context.TODO(), secretName, metav1.GetOptions{},
+					)
+					require.NoError(t, err)
+
+					// Verify secret type
+					assert.Equal(t, corev1.SecretTypeServiceAccountToken, secret.Type)
+
+					// Verify annotation linking to ServiceAccount
+					assert.Equal(t, saName, secret.Annotations[corev1.ServiceAccountNameKey])
+
+					// Verify OLM managed label
+					assert.Equal(t, "true", secret.Labels["olm.managed"])
+
+					// Verify secret name follows pattern
+					assert.Equal(t, secretName, secret.Name)
+				} else {
+					// Verify no duplicate secret was created
+					secrets, err := fakeClient.CoreV1().Secrets(namespace).List(
+						context.TODO(), metav1.ListOptions{},
+					)
+					require.NoError(t, err)
+
+					// Count token secrets with the expected name
+					tokenSecretCount := 0
+					for _, s := range secrets.Items {
+						if s.Name == saName+"-token" && s.Type == corev1.SecretTypeServiceAccountToken {
+							tokenSecretCount++
+						}
+					}
+
+					// Should be exactly 1 (the existing one), not 2 (duplicate)
+					assert.LessOrEqual(t, tokenSecretCount, 1, "should not create duplicate token secret")
+				}
 			}
 		})
 	}

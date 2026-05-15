@@ -142,6 +142,12 @@ func (o *StepEnsurer) EnsureBundleSecret(namespace string, secret *corev1.Secret
 func (o *StepEnsurer) EnsureServiceAccount(namespace string, sa *corev1.ServiceAccount) (status v1alpha1.StepStatus, err error) {
 	_, createErr := o.kubeClient.KubernetesInterface().CoreV1().ServiceAccounts(namespace).Create(context.TODO(), sa, metav1.CreateOptions{})
 	if createErr == nil {
+		// After create, ensure token secret exists for metrics scraping
+		// This is needed in Kubernetes 1.24+ where token secrets are not auto-created
+		if err = o.ensureServiceAccountTokenSecret(namespace, sa); err != nil {
+			err = errorwrap.Wrapf(err, "error ensuring token secret for service account: %s", sa.GetName())
+			return
+		}
 		status = v1alpha1.StepStatusCreated
 		return
 	}
@@ -182,8 +188,96 @@ func (o *StepEnsurer) EnsureServiceAccount(namespace string, sa *corev1.ServiceA
 		}
 	}
 
+	// After create/update, ensure token secret exists for metrics scraping
+	// This is needed in Kubernetes 1.24+ where token secrets are not auto-created
+	if err = o.ensureServiceAccountTokenSecret(namespace, sa); err != nil {
+		err = errorwrap.Wrapf(err, "error ensuring token secret for service account: %s", sa.GetName())
+		return
+	}
+
 	status = v1alpha1.StepStatusPresent
 	return
+}
+
+// ensureServiceAccountTokenSecret ensures a token secret exists for the ServiceAccount.
+// In Kubernetes 1.24+, token secrets are not automatically created, which breaks
+// ServiceMonitor resources that reference these secrets for Prometheus metrics scraping.
+//
+// This function:
+// 1. Checks if a token secret already exists
+// 2. If not, creates one with proper annotations and owner references
+// 3. The secret will be populated by Kubernetes with the actual token
+func (o *StepEnsurer) ensureServiceAccountTokenSecret(namespace string, sa *corev1.ServiceAccount) error {
+	// Check if ServiceAccount already has token secrets
+	if len(sa.Secrets) > 0 {
+		// Verify at least one is a token secret
+		for _, secretRef := range sa.Secrets {
+			secret, err := o.kubeClient.KubernetesInterface().CoreV1().Secrets(namespace).Get(
+				context.TODO(),
+				secretRef.Name,
+				metav1.GetOptions{},
+			)
+			if err != nil {
+				if apierrors.IsNotFound(err) {
+					continue
+				}
+				return err
+			}
+
+			// Check if it's a token secret
+			if secret.Type == corev1.SecretTypeServiceAccountToken {
+				// Token secret exists, nothing to do
+				return nil
+			}
+		}
+	}
+
+	// No token secret exists, create one
+	// Secret name pattern: <serviceaccount-name>-token
+	secretName := fmt.Sprintf("%s-token", sa.Name)
+
+	// Check if secret already exists (might have been orphaned)
+	existingSecret, err := o.kubeClient.KubernetesInterface().CoreV1().Secrets(namespace).Get(
+		context.TODO(),
+		secretName,
+		metav1.GetOptions{},
+	)
+
+	if err == nil {
+		// Secret exists, check if it's the correct type
+		if existingSecret.Type == corev1.SecretTypeServiceAccountToken {
+			// Already exists and is correct type, nothing to do
+			return nil
+		}
+		// Secret exists but is wrong type - delete it first
+		err = o.kubeClient.KubernetesInterface().CoreV1().Secrets(namespace).Delete(
+			context.TODO(), secretName, metav1.DeleteOptions{})
+		if err != nil {
+			return err
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	// Create the token secret
+	tokenSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      secretName,
+			Namespace: namespace,
+			Annotations: map[string]string{
+				corev1.ServiceAccountNameKey: sa.Name,
+			},
+			Labels: map[string]string{
+				install.OLMManagedLabelKey: install.OLMManagedLabelValue,
+			},
+		},
+		Type: corev1.SecretTypeServiceAccountToken,
+	}
+
+	_, err = o.kubeClient.KubernetesInterface().CoreV1().Secrets(namespace).Create(
+		context.TODO(), tokenSecret, metav1.CreateOptions{})
+
+	return err
 }
 
 // EnsureService writes the specified Service object to the cluster.
